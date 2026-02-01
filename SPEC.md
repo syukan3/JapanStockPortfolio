@@ -40,12 +40,18 @@
 Portfolio ユーザーが `authenticated` ロールで読み取れるよう、DataPipeline 側で以下を設定する。
 
 ```sql
+-- authenticated ロール（認証済みユーザー）
 GRANT USAGE ON SCHEMA jquants_core TO authenticated;
 GRANT SELECT ON ALL TABLES IN SCHEMA jquants_core TO authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA jquants_core GRANT SELECT ON TABLES TO authenticated;
+
+-- anon ロール（/stocks/[code] 公開ページ用、未認証ユーザーの市場データ閲覧）
+GRANT USAGE ON SCHEMA jquants_core TO anon;
+GRANT SELECT ON ALL TABLES IN SCHEMA jquants_core TO anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA jquants_core GRANT SELECT ON TABLES TO anon;
 ```
 
-**RLS について**: jquants_core テーブルは全ユーザー共通の公開市場データのため、RLS が有効な場合は DataPipeline 側で全テーブルに `FOR SELECT TO authenticated USING (true)` ポリシーを設定する。RLS が無効であれば GRANT のみで十分。DataPipeline 側の RLS 設定状況を実装前に確認すること。
+**RLS について**: jquants_core テーブルは全ユーザー共通の公開市場データのため、RLS が有効な場合は DataPipeline 側で全テーブルに `FOR SELECT TO authenticated, anon USING (true)` ポリシーを設定する（`anon` は `/stocks/[code]` 公開ページで未認証ユーザーがアクセスするため必須）。RLS が無効であれば GRANT のみで十分。DataPipeline 側の RLS 設定状況を実装前に確認すること。
 
 ### jquants_core 側で必要なインデックス
 
@@ -328,15 +334,159 @@ $$;
 
 ### `portfolio.fn_portfolio_summary(p_portfolio_id uuid)`
 
-ポートフォリオ全体のサマリ（総資産評価額、総投資額、含み損益）を返す。
+ポートフォリオ全体のサマリ（総資産評価額、総投資額、含み損益、日次変動）を返す。
+
+```sql
+CREATE OR REPLACE FUNCTION portfolio.fn_portfolio_summary(p_portfolio_id uuid)
+RETURNS TABLE(
+  total_market_value numeric(14,2),     -- 総資産評価額（現在値 × 数量の合計）
+  total_cost numeric(14,2),             -- 総投資額（平均取得単価 × 数量の合計）
+  unrealized_pnl numeric(14,2),         -- 含み損益
+  unrealized_pnl_pct numeric(8,4),      -- 含み損益率(%)
+  daily_change numeric(14,2),           -- 日次変動額（当日終値 - 前営業日終値）× 数量 の合計
+  daily_change_pct numeric(8,4)         -- 日次変動率(%)
+)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  WITH holdings AS (
+    SELECT local_code, total_quantity, avg_cost
+    FROM portfolio.fn_holdings_summary(p_portfolio_id)
+  ),
+  prev_business_day AS (
+    SELECT MAX(calendar_date) AS prev_date
+    FROM jquants_core.trading_calendar
+    WHERE is_business_day = true
+      AND calendar_date < CURRENT_DATE
+  ),
+  priced AS (
+    SELECT
+      h.local_code,
+      h.total_quantity,
+      h.avg_cost,
+      lp.adj_close AS latest_close,
+      pp.adj_close AS prev_close
+    FROM holdings h
+    LEFT JOIN LATERAL (
+      SELECT ebd.adj_close FROM jquants_core.equity_bar_daily ebd
+      WHERE ebd.local_code = h.local_code ORDER BY ebd.trade_date DESC LIMIT 1
+    ) lp ON true
+    LEFT JOIN LATERAL (
+      SELECT ebd.adj_close FROM jquants_core.equity_bar_daily ebd
+      WHERE ebd.local_code = h.local_code
+        AND ebd.trade_date <= (SELECT prev_date FROM prev_business_day)
+      ORDER BY ebd.trade_date DESC LIMIT 1
+    ) pp ON true
+  )
+  SELECT
+    ROUND(SUM(latest_close * total_quantity), 2),
+    ROUND(SUM(avg_cost * total_quantity), 2),
+    ROUND(SUM((latest_close - avg_cost) * total_quantity), 2),
+    ROUND(SUM((latest_close - avg_cost) * total_quantity)
+      / NULLIF(SUM(avg_cost * total_quantity), 0) * 100, 4),
+    ROUND(SUM((latest_close - COALESCE(prev_close, latest_close)) * total_quantity), 2),
+    ROUND(SUM((latest_close - COALESCE(prev_close, latest_close)) * total_quantity)
+      / NULLIF(SUM(COALESCE(prev_close, latest_close) * total_quantity), 0) * 100, 4)
+  FROM priced;
+$$;
+```
+
+**日次変動の計算方式**: `trading_calendar` で `is_business_day = true` かつ `CURRENT_DATE` 未満の最大日付を「前営業日」とし、各銘柄の前営業日終値と最新終値の差に保有数量を掛けて合算する。
 
 ### `portfolio.fn_sector_allocation(p_portfolio_id uuid)`
 
 セクター別の資産配分を返す。
 
+```sql
+CREATE OR REPLACE FUNCTION portfolio.fn_sector_allocation(p_portfolio_id uuid)
+RETURNS TABLE(
+  sector17_name text,
+  market_value numeric(14,2),      -- セクター別時価評価額
+  allocation_pct numeric(8,4)      -- 構成比率(%)
+)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  WITH holdings AS (
+    SELECT local_code, total_quantity, latest_close, sector17_name
+    FROM portfolio.fn_holdings_summary(p_portfolio_id)
+  ),
+  sector_totals AS (
+    SELECT
+      COALESCE(sector17_name, '不明') AS sector17_name,
+      SUM(latest_close * total_quantity) AS market_value
+    FROM holdings
+    GROUP BY COALESCE(sector17_name, '不明')
+  )
+  SELECT
+    s.sector17_name,
+    ROUND(s.market_value, 2),
+    ROUND(s.market_value / NULLIF(SUM(s.market_value) OVER (), 0) * 100, 4)
+  FROM sector_totals s
+  ORDER BY s.market_value DESC;
+$$;
+```
+
 ### `portfolio.fn_portfolio_performance(p_portfolio_id uuid, p_from date, p_to date)`
 
 日次の時価推移データを返す（パフォーマンスチャート用）。
+
+```sql
+CREATE OR REPLACE FUNCTION portfolio.fn_portfolio_performance(
+  p_portfolio_id uuid, p_from date, p_to date
+)
+RETURNS TABLE(
+  trade_date date,
+  portfolio_value numeric(14,2),   -- ポートフォリオ時価評価額
+  topix_close numeric(18,6),       -- TOPIX 終値（ベンチマーク）
+  portfolio_index numeric(10,4),   -- ポートフォリオ指数（基準日=100）
+  topix_index numeric(10,4)        -- TOPIX 指数（基準日=100）
+)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  -- 保有銘柄・数量は fn_holdings_summary の現在スナップショットを使用
+  -- （期間中の売買による変動は Phase 2 で厳密化。MVP では現在保有ベース）
+  WITH holdings AS (
+    SELECT local_code, total_quantity
+    FROM portfolio.fn_holdings_summary(p_portfolio_id)
+  ),
+  business_days AS (
+    SELECT calendar_date
+    FROM jquants_core.trading_calendar
+    WHERE is_business_day = true
+      AND calendar_date BETWEEN p_from AND p_to
+  ),
+  daily_values AS (
+    SELECT
+      bd.calendar_date AS trade_date,
+      SUM(ebd.adj_close * h.total_quantity) AS portfolio_value
+    FROM business_days bd
+    CROSS JOIN holdings h
+    LEFT JOIN LATERAL (
+      SELECT ebd2.adj_close FROM jquants_core.equity_bar_daily ebd2
+      WHERE ebd2.local_code = h.local_code AND ebd2.trade_date <= bd.calendar_date
+      ORDER BY ebd2.trade_date DESC LIMIT 1
+    ) ebd ON true
+    GROUP BY bd.calendar_date
+  ),
+  base_values AS (
+    SELECT
+      portfolio_value AS base_pf,
+      (SELECT t.close FROM jquants_core.topix_bar_daily t
+       WHERE t.trade_date <= p_from ORDER BY t.trade_date DESC LIMIT 1) AS base_topix
+    FROM daily_values WHERE trade_date = (SELECT MIN(trade_date) FROM daily_values)
+  )
+  SELECT
+    dv.trade_date,
+    ROUND(dv.portfolio_value, 2),
+    tp.close,
+    ROUND(dv.portfolio_value / NULLIF((SELECT base_pf FROM base_values), 0) * 100, 4),
+    ROUND(tp.close / NULLIF((SELECT base_topix FROM base_values), 0) * 100, 4)
+  FROM daily_values dv
+  LEFT JOIN jquants_core.topix_bar_daily tp ON tp.trade_date = dv.trade_date
+  ORDER BY dv.trade_date;
+$$;
+```
+
+**制約（MVP）**: 現在の保有銘柄・数量でさかのぼって計算するため、期間中に売買があった場合は厳密ではない。Phase 2 で取引履歴を考慮した厳密版に改良する。
 
 ### `portfolio.fn_realized_pnl(p_portfolio_id uuid)`
 
