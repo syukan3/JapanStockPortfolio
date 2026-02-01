@@ -11,7 +11,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
 
 ### Phase 0: 基盤構築
 
-- [ ] **Step 1: プロジェクトスキャフォールディング** (~12 files)
+- [x] **Step 1: プロジェクトスキャフォールディング** (~12 files)
   - [ ] `npx create-next-app@latest`（App Router, TypeScript, Tailwind, Turbopack）
   - [ ] 依存追加: `@supabase/ssr`, `@supabase/supabase-js`, `zod`, `recharts`, `lightweight-charts`, `swr`, `@vercel/analytics`
   - [ ] shadcn/ui 初期化 + 基本コンポーネント追加（button, input, card, table, dialog, select, toast, skeleton, tabs, badge, dropdown-menu, label）
@@ -19,13 +19,13 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] ESLint 設定
   - [ ] 検証: `npm run dev` 起動、`npm run build` 成功
 
-- [ ] **Step 2: Supabase クライアントライブラリ** (~3 files)
+- [x] **Step 2: Supabase クライアントライブラリ** (~3 files)
   - [ ] `lib/supabase/server.ts` — `React.cache()` ラップ `createServerClient`
   - [ ] `lib/supabase/client.ts` — `createBrowserClient` シングルトン
   - [ ] `lib/supabase/anon.ts` — cookies 不使用 anon クライアント（`"use cache"` 用）
   - [ ] 検証: テストページでインポート、エラーなし
 
-- [ ] **Step 3: proxy.ts（認証ルーティング）** (1 file) ※Next.js 16 で `middleware.ts` は `proxy.ts` に置き換え
+- [x] **Step 3: proxy.ts（認証ルーティング）** (1 file) ※Next.js 16 で `middleware.ts` は `proxy.ts` に置き換え
   - [ ] `proxy.ts` をプロジェクトルートに配置（Next.js 16 の正式エントリポイント、`middleware.ts` は非推奨）
   - [ ] Node.js ランタイム固定（Next.js 16 の proxy.ts は自動的に Node.js で実行、runtime export 不要）
   - [ ] セッション自動リフレッシュ（全リクエスト）
@@ -34,7 +34,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] matcher: `_next/static`, `_next/image`, `favicon.ico` 除外
   - [ ] 検証: 未認証で `/dashboard` → `/login` リダイレクト、`/login` と `/auth/callback` はブロックされない
 
-- [ ] **Step 4: 認証ページ（F1）** (~8 files)
+- [x] **Step 4: 認証ページ（F1）** (~8 files)
   - [ ] `app/(auth)/layout.tsx` — センター配置カードレイアウト
   - [ ] `app/(auth)/login/page.tsx` — メール+パスワードログイン
   - [ ] `app/(auth)/signup/page.tsx` — サインアップ
@@ -44,7 +44,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] `lib/validations/auth.ts` — Zod スキーマ
   - [ ] 検証: アカウント作成 → ログイン → ログアウト → パスワードリセット
 
-- [ ] **Step 5: DB マイグレーション — スキーマ + テーブル** (~3 files) ※Step 1〜4 と並列可
+- [x] **Step 5: DB マイグレーション — スキーマ + テーブル** (~3 files) ※Step 1〜4 と並列可
   - [ ] `supabase init`
   - [ ] `00001_portfolio_schema.sql`: `CREATE EXTENSION IF NOT EXISTS pgcrypto`, CREATE SCHEMA, GRANT, domain型, 5テーブル, インデックス, トリガー
   - [ ] `00002_portfolio_rls.sql`: RLS 有効化 + 全 CRUD ポリシー
@@ -53,7 +53,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
 
 ### Phase 1: ダッシュボード MVP
 
-- [ ] **Step 6: DB マイグレーション — RPC 関数** (~1 file)
+- [x] **Step 6: DB マイグレーション — RPC 関数** (~1 file)
   - [ ] `00003_portfolio_rpc.sql`: fn_holdings_summary, fn_portfolio_summary, fn_sector_allocation
   - [ ] GRANT EXECUTE to authenticated
   - [ ] DataPipeline 側: 2インデックス追加依頼（別リポジトリ PR）
@@ -67,7 +67,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] Supabase クライアントに `Database` ジェネリック適用
   - [ ] 検証: テーブル名・カラム名の自動補完
 
-- [ ] **Step 8: Protected レイアウト + ナビゲーション** (~6 files)
+- [x] **Step 8: Protected レイアウト + ナビゲーション** (~6 files)
   - [ ] `app/(protected)/layout.tsx` — ユーザー取得、サイドバー、コンテキスト
   - [ ] `components/layout/sidebar.tsx` — ナビリンク
   - [ ] `components/layout/header.tsx` — ユーザーメニュー、ポートフォリオセレクター
@@ -75,7 +75,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] `lib/queries/user-settings.ts` — `getDefaultPortfolioId()` with `React.cache()`
   - [ ] 検証: ページ遷移でサイドバーハイライト、ユーザー情報表示
 
-- [ ] **Step 9: ポートフォリオ CRUD（F2）** (~6 files)
+- [x] **Step 9: ポートフォリオ CRUD（F2）** (~6 files)
   - [ ] `app/(protected)/portfolios/page.tsx` — 一覧（カード表示）
   - [ ] `app/(protected)/portfolios/[id]/page.tsx` — ポートフォリオ詳細（保有銘柄・取引サマリ）
   - [ ] `components/portfolio/portfolio-form.tsx` — 作成/編集ダイアログ
@@ -84,7 +84,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] 初回ポートフォリオ作成時に user_settings 自動生成
   - [ ] 検証: 作成 → 一覧表示 → 編集 → 削除
 
-- [ ] **Step 10: 取引登録（F3）** (~7 files)
+- [x] **Step 10: 取引登録（F3）** (~7 files)
   - [ ] `app/(protected)/transactions/page.tsx` — 取引一覧（フィルタ・ソート）
   - [ ] `app/(protected)/transactions/new/page.tsx` — 登録フォーム
   - [ ] `components/transaction/transaction-form.tsx` — フォーム本体
@@ -93,7 +93,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] `app/(protected)/portfolios/[id]/transactions/page.tsx` — ポートフォリオ別取引
   - [ ] 検証: 買い登録 → 一覧 → 売り登録 → オートコンプリート動作
 
-- [ ] **Step 11: ダッシュボード（F4）** (~9 files)
+- [x] **Step 11: ダッシュボード（F4）** (~9 files)
   - [ ] `app/(protected)/dashboard/page.tsx` — Suspense 3境界で並列ストリーミング
   - [ ] `components/dashboard/summary-cards.tsx` + skeleton — fn_portfolio_summary RPC（日次変動＝前営業日比も含む）
   - [ ] `components/dashboard/holdings-table.tsx` + skeleton — fn_holdings_summary RPC
@@ -101,7 +101,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] `lib/queries/dashboard.ts` — RPC 呼び出しラッパー
   - [ ] 検証: サマリカード、保有銘柄テーブル（損益）、セクター円グラフ
 
-- [ ] **Step 12: 銘柄詳細ページ（F5）** (~6 files) ※Step 9〜11 と独立
+- [x] **Step 12: 銘柄詳細ページ（F5）** (~6 files) ※Step 9〜11 と独立
   - [ ] `app/(public)/stocks/[code]/page.tsx` — `"use cache"` + `cacheLife("minutes")` + `cacheTag("stock-${code}")`、anon クライアント
   - [ ] `components/stock/candlestick-chart.tsx` — Lightweight Charts (dynamic ssr:false)
   - [ ] `components/stock/stock-fundamentals.tsx` — PER/PBR/ROE/配当利回り
@@ -110,7 +110,7 @@ MVP は Phase 0 + Phase 1（F1〜F5）。全16ステップ、約68ファイル�
   - [ ] `lib/queries/stock.ts` — anon クエリ
   - [ ] 検証: 未認証で `/stocks/13010` アクセス可、キャッシュヘッダー確認
 
-- [ ] **Step 13: エラーハンドリング + 空状態** (~5 files)
+- [x] **Step 13: エラーハンドリング + 空状態** (~5 files)
   - [ ] `app/error.tsx` — グローバルエラー（リトライボタン）
   - [ ] `app/not-found.tsx` — 404
   - [ ] `app/loading.tsx` — グローバル skeleton
