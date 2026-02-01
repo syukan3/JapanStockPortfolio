@@ -8,11 +8,14 @@
 
 | 項目 | 決定事項 |
 |---|---|
-| フレームワーク | Next.js 15 (App Router) + TypeScript |
+| フレームワーク | Next.js 16 (App Router) + TypeScript |
 | UI | Tailwind CSS + shadcn/ui |
 | DB | Supabase（JapanStockDataPipelineと共有） |
 | 認証 | Supabase Auth（複数ユーザー対応・RLS） |
 | チャート | Lightweight Charts (TradingView) / Recharts |
+| バンドラー | Turbopack（Next.js 16 デフォルト） |
+| React | 19.2 |
+| Node.js | 20.9+ |
 | デプロイ | Vercel |
 | 優先度 | ダッシュボード重視 |
 | 言語 | 日本語のみ対応 |
@@ -49,9 +52,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA jquants_core GRANT SELECT ON TABLES TO authen
 Portfolio の RPC 関数が効率的に動作するため、DataPipeline 側で以下のインデックスが必要。
 
 ```sql
--- 最新株価取得（DISTINCT ON）用 — 既存の idx_equity_bar_daily_date では不十分
+-- 最新株価取得（LATERAL JOIN）用 — 既存の idx_equity_bar_daily_date では不十分
 CREATE INDEX IF NOT EXISTS idx_equity_bar_daily_code_date
   ON jquants_core.equity_bar_daily (local_code, trade_date DESC);
+
+-- equity_master の is_current=true フィルタ用部分インデックス
+CREATE INDEX IF NOT EXISTS idx_equity_master_code_current
+  ON jquants_core.equity_master (local_code) WHERE is_current = true;
 ```
 
 ---
@@ -71,6 +78,16 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA portfolio TO authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authenticated;
 -- anon ロールにはアクセスを許可しない（認証必須）
 ```
+
+### ドメイン型
+
+```sql
+-- 銘柄コードのドメイン型（CHECK 制約の重複を排除）
+CREATE DOMAIN portfolio.local_code_t AS text
+  CHECK (VALUE ~ '^\d{5}$');
+```
+
+各テーブルの `local_code` カラムは `portfolio.local_code_t` 型を使用する。個別テーブルでの `CHECK (local_code ~ '^\d{5}$')` は不要になる。
 
 ### PK 戦略
 
@@ -105,7 +122,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authe
 | id | bigint PK | generated always as identity |
 | portfolio_id | uuid NOT NULL | FK (portfolio_id, user_id) REFERENCES portfolios(id, user_id) ON DELETE CASCADE |
 | user_id | uuid NOT NULL | RLS key（冗長だがRLSパフォーマンスのため。複合FKで整合性保証） |
-| local_code | text NOT NULL | 銘柄コード（5桁） |
+| local_code | local_code_t NOT NULL | 銘柄コード（5桁、ドメイン型） |
 | trade_type | text NOT NULL | 'buy' / 'sell' |
 | trade_date | date NOT NULL | 約定日 |
 | quantity | integer NOT NULL | 株数（正の整数） |
@@ -115,7 +132,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authe
 | notes | text | メモ |
 | created_at | timestamptz | DEFAULT now() |
 
-**CHECK**: quantity > 0, unit_price > 0, commission >= 0, tax >= 0, trade_type IN ('buy', 'sell'), local_code ~ '^\d{5}$'
+**CHECK**: quantity > 0, unit_price > 0, commission >= 0, tax >= 0, trade_type IN ('buy', 'sell')
 **INDEX**:
 - (user_id, portfolio_id) — RLS + ポートフォリオ別取引一覧
 - (portfolio_id, local_code, trade_date, id) — 銘柄別保有数量集計 + 移動平均計算の時系列ソート
@@ -130,14 +147,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authe
 |---|---|---|
 | id | uuid PK | DEFAULT gen_random_uuid() |
 | user_id | uuid NOT NULL | RLS key |
-| local_code | text NOT NULL | 銘柄コード |
+| local_code | local_code_t NOT NULL | 銘柄コード（5桁、ドメイン型） |
 | memo | text | メモ |
 | target_price | numeric(12,2) | 目標株価 |
 | sort_order | integer DEFAULT 0 | 表示順 |
 | created_at | timestamptz | DEFAULT now() |
 
 **UNIQUE**: (user_id, local_code) — ユニーク制約がインデックスを兼ねる
-**CHECK**: local_code ~ '^\d{5}$'
 
 ### `portfolio.dividend_records`
 
@@ -148,7 +164,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authe
 | id | uuid PK | DEFAULT gen_random_uuid() |
 | user_id | uuid NOT NULL | RLS key |
 | portfolio_id | uuid NOT NULL | FK (portfolio_id, user_id) REFERENCES portfolios(id, user_id) |
-| local_code | text NOT NULL | 銘柄コード |
+| local_code | local_code_t NOT NULL | 銘柄コード（5桁、ドメイン型） |
 | record_date | date NOT NULL | 権利確定日 |
 | payment_date | date | 入金日 |
 | dividend_per_share | numeric(10,4) NOT NULL | 1株あたり配当金 |
@@ -159,7 +175,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA portfolio GRANT EXECUTE ON FUNCTIONS TO authe
 | created_at | timestamptz | DEFAULT now() |
 
 **UNIQUE**: (user_id, portfolio_id, local_code, record_date)
-**CHECK**: quantity > 0, gross_amount > 0, tax_amount >= 0, net_amount > 0, local_code ~ '^\d{5}$'
+**CHECK**: quantity > 0, gross_amount > 0, tax_amount >= 0, net_amount > 0
 **INDEX**:
 - (portfolio_id) — FK インデックス（CASCADE 削除用）
 - (user_id, record_date) — 月別・年別集計用
@@ -233,47 +249,52 @@ LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = ''
 AS $$
 DECLARE
   rec RECORD;
-  v_code text;
-  v_qty int;
-  v_total_cost numeric;
-  v_avg numeric;
+  v_code text := '';
+  v_qty int := 0;
+  v_avg numeric := 0;
+  v_total_cost numeric := 0;
+  -- 銘柄ごとの保有情報を配列で保持（TEMP TABLE を使わない）
+  v_codes text[] := '{}';
+  v_qtys int[] := '{}';
+  v_avgs numeric[] := '{}';
 BEGIN
-  -- 銘柄ごとに取引を時系列順に処理し、移動平均法で平均取得単価を算出
-  -- 移動平均法: 買い→(既存保有額+新規取得額)/(既存数量+新規数量)、売り→数量減のみ(単価不変)
-  CREATE TEMP TABLE _holdings (
-    code text PRIMARY KEY,
-    qty int NOT NULL,
-    avg_unit_cost numeric NOT NULL
-  ) ON COMMIT DROP;
-
-  FOR v_code IN
-    SELECT DISTINCT t.local_code FROM portfolio.transactions t
+  -- 単一クエリで全取引を取得し、local_code の変化を検知してループ（N+1 回避）
+  -- 明示的に user_id フィルタを追加（RLS + プランナーのインデックス活用）
+  FOR rec IN
+    SELECT t.local_code, t.trade_type, t.quantity, t.unit_price, t.commission, t.tax
+    FROM portfolio.transactions t
     WHERE t.portfolio_id = p_portfolio_id
+      AND t.user_id = (select auth.uid())
+    ORDER BY t.local_code, t.trade_date, t.id
   LOOP
-    v_qty := 0;
-    v_total_cost := 0;
-    v_avg := 0;
-
-    FOR rec IN
-      SELECT t.trade_type, t.quantity, t.unit_price, t.commission, t.tax
-      FROM portfolio.transactions t
-      WHERE t.portfolio_id = p_portfolio_id AND t.local_code = v_code
-      ORDER BY t.trade_date, t.id
-    LOOP
-      IF rec.trade_type = 'buy' THEN
-        v_total_cost := v_qty * v_avg + rec.quantity * rec.unit_price + rec.commission + rec.tax;
-        v_qty := v_qty + rec.quantity;
-        v_avg := v_total_cost / NULLIF(v_qty, 0);
-      ELSE -- sell
-        v_qty := v_qty - rec.quantity;
-        -- 売却時は平均単価を維持（移動平均法）
+    -- 銘柄が切り替わったら前の銘柄を保存
+    IF rec.local_code IS DISTINCT FROM v_code THEN
+      IF v_qty > 0 THEN
+        v_codes := array_append(v_codes, v_code);
+        v_qtys := array_append(v_qtys, v_qty);
+        v_avgs := array_append(v_avgs, ROUND(v_avg, 2));
       END IF;
-    END LOOP;
+      v_code := rec.local_code;
+      v_qty := 0;
+      v_avg := 0;
+    END IF;
 
-    IF v_qty > 0 THEN
-      INSERT INTO _holdings VALUES (v_code, v_qty, ROUND(v_avg, 2));
+    -- 移動平均法: 買い→(既存保有額+新規取得額)/(既存数量+新規数量)、売り→数量減のみ(単価不変)
+    IF rec.trade_type = 'buy' THEN
+      v_total_cost := v_qty * v_avg + rec.quantity * rec.unit_price + rec.commission + rec.tax;
+      v_qty := v_qty + rec.quantity;
+      v_avg := v_total_cost / NULLIF(v_qty, 0);
+    ELSE -- sell
+      v_qty := v_qty - rec.quantity;
     END IF;
   END LOOP;
+
+  -- 最後の銘柄を保存
+  IF v_qty > 0 THEN
+    v_codes := array_append(v_codes, v_code);
+    v_qtys := array_append(v_qtys, v_qty);
+    v_avgs := array_append(v_avgs, ROUND(v_avg, 2));
+  END IF;
 
   -- 最新株価を LATERAL JOIN で取得（インデックス利用が確実）
   -- 前提: jquants_core.equity_bar_daily に (local_code, trade_date DESC) インデックスが必要
@@ -287,11 +308,11 @@ BEGIN
     lp.adj_close,
     ROUND((lp.adj_close - h.avg_unit_cost) * h.qty, 2),
     ROUND((lp.adj_close - h.avg_unit_cost) / NULLIF(h.avg_unit_cost, 0) * 100, 4)
-  FROM _holdings h
+  FROM unnest(v_codes, v_qtys, v_avgs) AS h(code, qty, avg_unit_cost)
   LEFT JOIN LATERAL (
-    SELECT adj_close FROM jquants_core.equity_bar_daily
-    WHERE jquants_core.equity_bar_daily.local_code = h.code
-    ORDER BY trade_date DESC LIMIT 1
+    SELECT ebd.adj_close FROM jquants_core.equity_bar_daily ebd
+    WHERE ebd.local_code = h.code
+    ORDER BY ebd.trade_date DESC LIMIT 1
   ) lp ON true
   LEFT JOIN jquants_core.equity_master em
     ON em.local_code = h.code AND em.is_current = true;
@@ -299,10 +320,11 @@ END;
 $$;
 ```
 
-**注意**: 移動平均法では売却が挟まる場合に単純な `SUM(buy)/COUNT(buy)` と結果が異なる。
-例: 100株@1000円購入 → 50株売却 → 100株@1500円購入 の場合、
-単純平均は1250円だが、移動平均法では `(50*1000+100*1500)/150 = 1333円` となる。
-上記の plpgsql 実装は取引を時系列順にループし、正しい移動平均単価を算出する。
+**設計ポイント**:
+- **TEMP TABLE 不使用**: 配列変数で保持し、`unnest()` で展開。`STABLE` 宣言と整合し、カタログロック競合を回避。Supabase の transaction mode pooling とも互換
+- **N+1 回避**: 単一クエリで全取引を `ORDER BY local_code, trade_date, id` で取得し、`local_code` の変化を検知して1回のループで処理
+- **明示的 user_id フィルタ**: RLS に加えて `WHERE t.user_id = (select auth.uid())` を明示。プランナーがインデックス `(user_id, portfolio_id)` を活用可能に
+- **移動平均法**: 買い→`(既存保有額+新規取得額)/(既存数量+新規数量)`、売り→数量減のみ（単価不変）。例: 100株@1000円購入 → 50株売却 → 100株@1500円購入 → 平均単価 `(50*1000+100*1500)/150 = 1333円`
 
 ### `portfolio.fn_portfolio_summary(p_portfolio_id uuid)`
 
@@ -335,11 +357,22 @@ $$;
 
 `@supabase/ssr` パッケージを使用する（`@supabase/auth-helpers-nextjs` は非推奨）。
 
+Supabase Server Client は `React.cache()` でリクエスト単位にキャッシュし、同一リクエスト内で複数の Server Component が同じクライアントインスタンスを共有する。
+
+```ts
+// lib/supabase/server.ts
+import { cache } from "react";
+export const getSupabaseServer = cache(async () => {
+  const cookieStore = await cookies();
+  return createServerClient(/* url, key, { cookies: ... } */);
+});
+```
+
 | コンテキスト | 関数 | 用途 |
 |---|---|---|
 | Server Components / Route Handlers / Server Actions | `createServerClient()` | cookies() 経由でセッション取得 |
 | Client Components | `createBrowserClient()` | ブラウザ側の認証・データ取得 |
-| Middleware | `createServerClient()` | セッションリフレッシュ + 未認証リダイレクト |
+| Proxy (proxy.ts) | `createServerClient()` | セッションリフレッシュ + 未認証リダイレクト（Node.jsランタイム） |
 
 ### 環境変数
 
@@ -360,7 +393,7 @@ Vercel で Production / Preview 環境を分離して管理する。
 #### F1: 認証
 - Supabase Auth（メール+パスワード）
 - ログイン / サインアップ / ログアウト / パスワードリセット
-- 全ページを認証必須にする（Middleware で制御）
+- 全ページを認証必須にする（Proxy で制御）
 - 認証済みユーザーが `/login`, `/signup` にアクセスした場合は `/dashboard` にリダイレクト
 
 ### Phase 1: ダッシュボード（MVP）
@@ -374,6 +407,7 @@ Vercel で Production / Preview 環境を分離して管理する。
 - 銘柄コード入力時にequity_masterから銘柄名をオートコンプリート
   - ~4000件（code + name で約200KB、gzip後 ~50KB）をSWRキャッシュし、クライアント側フィルタリング
   - フェッチタイミング: 入力フォーカス時に遅延ロード（初期バンドルに含めない）
+  - SWR 設定: `{ revalidateOnFocus: false, revalidateOnReconnect: false, dedupingInterval: 86400000 }`（銘柄マスタは日次更新のため24時間キャッシュ）
 - 取引一覧表示（フィルタ・ソート）
 
 #### F4: ダッシュボード
@@ -451,7 +485,12 @@ export default async function DashboardPage() {
 
 ### チャートコンポーネント
 
-全チャートは `next/dynamic` でクライアントのみ遅延ロードする（SSR しない）。
+全チャートは `next/dynamic` でクライアントのみ遅延ロードする（SSR しない）。各ページで使用するライブラリのみ dynamic import し、未使用ライブラリはバンドルに含めない。
+
+| ページ | ライブラリ | 用途 |
+|---|---|---|
+| ダッシュボード | Recharts | 円グラフ（セクター配分）・折れ線グラフ（パフォーマンス） |
+| 銘柄詳細 (`/stocks/[code]`) | Lightweight Charts | ローソク足 + 出来高 |
 
 ```tsx
 const CandlestickChart = dynamic(
@@ -462,12 +501,14 @@ const CandlestickChart = dynamic(
 
 ### ページ別キャッシュ戦略
 
+Next.js 16 ではキャッシュは明示的 opt-in（`"use cache"` ディレクティブ）。デフォルトではすべて動的実行される。
+
 | ページ | 戦略 | 理由 |
 |---|---|---|
-| `/dashboard` | SSR (dynamic) + Suspense ストリーミング | ユーザー固有データ、常に最新 |
-| `/stocks/[code]` | ISR (revalidate: 300) for 公開データ + Client SWR for ユーザー固有データ | 株価・企業情報はISR、保有状況・ウォッチリスト状態はClient Componentで取得 |
-| `/login`, `/signup` | Static | ユーザー非依存 |
-| `/portfolios/[id]` | SSR (dynamic) | ユーザー固有データ |
+| `/dashboard` | Dynamic + Suspense ストリーミング | ユーザー固有データ、常に最新 |
+| `/stocks/[code]` | `"use cache"` + `cacheLife("minutes")` for 公開データ + Client SWR for ユーザー固有データ | 株価・企業情報はキャッシュ、保有状況・ウォッチリスト状態はClient Componentで取得 |
+| `/login`, `/signup` | `"use cache"` (Static) | ユーザー非依存 |
+| `/portfolios/[id]` | Dynamic | ユーザー固有データ |
 
 ---
 
@@ -481,9 +522,38 @@ const CandlestickChart = dynamic(
 | アクセシビリティ | WCAG 2.1 AA準拠（shadcn/uiベース） |
 | テスト | Vitest + Playwright（E2E） |
 | CI/CD | GitHub Actions → Vercel Preview/Production |
-| 監視 | Vercel Analytics + Supabase Dashboard。将来的に Sentry 導入検討 |
+| 監視 | Vercel Analytics（`@vercel/analytics` の `<Analytics />` を root layout に配置、内部で自動遅延ロード） + Supabase Dashboard。将来 Sentry 導入時は `next/script strategy="afterInteractive"` を使用 |
 | バックアップ | Supabase 自動バックアップに依存 |
 | オフライン | 非対応（PWA は Phase 3+ で検討可） |
+
+---
+
+## Server Actions セキュリティ要件
+
+Server Actions は公開エンドポイントとして扱い、proxy.ts のガードに依存しない。
+
+- **認証チェック**: 全 Server Action の先頭で `supabase.auth.getUser()` を実行し、未認証なら即座にエラーを返す。RLS は二重防御として機能させる
+- **入力バリデーション**: Zod スキーマで全入力を検証する。型安全性だけでなく、ビジネスルール（quantity > 0、local_code 5桁等）も Zod で定義
+- **エラーハンドリング**: Server Action 内のエラーはクライアントに安全な形で返す（内部エラー詳細を露出しない）
+
+```ts
+// Server Action の共通パターン
+"use server";
+async function createTransaction(formData: FormData) {
+  const supabase = await createServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error("Unauthorized");
+
+  const parsed = transactionSchema.safeParse(Object.fromEntries(formData));
+  if (!parsed.success) throw new Error("Validation failed");
+
+  // RLS が適用された状態で INSERT
+  const { error } = await supabase
+    .from("transactions")
+    .insert({ ...parsed.data, user_id: user.id });
+  if (error) throw new Error("Failed to create transaction");
+}
+```
 
 ---
 
@@ -492,7 +562,7 @@ const CandlestickChart = dynamic(
 | エラー種別 | 対応 |
 |---|---|
 | Supabase 接続エラー | `error.tsx` でリトライボタン付きエラー画面 |
-| 認証期限切れ (401) | Middleware でセッションリフレッシュ。失敗時 `/login` にリダイレクト |
+| 認証期限切れ (401) | proxy.ts でセッションリフレッシュ。失敗時 `/login` にリダイレクト |
 | RLS 違反 (403) | ログアウト + `/login` にリダイレクト |
 | データ未取得 | `not-found.tsx` または空状態コンポーネント |
 | Server Action 失敗 | トースト通知で再試行を促す |
@@ -509,8 +579,8 @@ app/
     reset-password/page.tsx  → パスワードリセット
   (public)/                  ← 認証不要・ISR対応グループ
     stocks/
-      [code]/page.tsx        → 銘柄詳細（F5）— ISR (revalidate: 300)
-                               公開データのみSSR、保有/ウォッチリストはClient SWR
+      [code]/page.tsx        → 銘柄詳細（F5）— "use cache" + cacheLife("minutes")
+                               公開データはキャッシュ、保有/ウォッチリストはClient SWR
   (protected)/               ← 認証必須グループ（cookies()使用 → 常にdynamic）
     layout.tsx               → Supabase セッション検証・ユーザー情報コンテキスト提供
     dashboard/
@@ -530,15 +600,27 @@ app/
   error.tsx                  → グローバルエラー画面
   not-found.tsx              → 404 画面
   loading.tsx                → グローバルローディング（skeleton UI）
-middleware.ts                → セッションリフレッシュ + 認証リダイレクト
+proxy.ts                   → セッションリフレッシュ + 認証リダイレクト（Node.jsランタイム）
 ```
 
-**注意**: `/stocks/[code]` は `(public)` グループに配置し、cookies() を使わないことで ISR を有効にする。公開市場データ（株価・企業情報・決算）は `service_role` ではなく別途 ISR 用のサーバーサイドフェッチで取得する。ユーザー固有データ（保有状況・ウォッチリスト）は Client Component + SWR で認証付きで取得する。Middleware は `/stocks/[code]` でもセッションリフレッシュは行うが、未認証時のリダイレクトはスキップする。
+**注意**: `/stocks/[code]` は `(public)` グループに配置し、`"use cache"` で公開市場データをキャッシュする。Proxy は `/stocks/[code]` でもセッションリフレッシュは行うが、未認証時のリダイレクトはスキップする。
 
-### Middleware
+#### `/stocks/[code]` のキャッシュ / 認証境界
+
+| 区分 | レンダリング | データ取得方法 | 認証依存 |
+|---|---|---|---|
+| Server Component (cached) | `"use cache"` + `cacheTag("stock-${code}")` | anon key の Supabase クライアント（cookies 不使用） | なし |
+| Client Component (dynamic) | SWR | `createBrowserClient()` で認証付き取得 | あり |
+
+- **cached 部分**: 株価データ、企業情報、決算データ。`createServerClient()` (cookies ベース) を**使用してはならない**。anon key で認証なしフェッチし、全ユーザーで共有キャッシュとする
+- **dynamic 部分**: 保有状況、ウォッチリスト登録状態。Client Component + SWR で `createBrowserClient()` を使用
+
+### Proxy（Next.js 16 の proxy.ts）
+
+Next.js 16 では `middleware.ts` が `proxy.ts` に置き換えられた（Node.js ランタイムで実行）。
 
 ```ts
-// middleware.ts
+// proxy.ts
 // - 全リクエストで Supabase セッションを自動リフレッシュ
 // - 未認証ユーザーを /login にリダイレクト
 // - 認証済みユーザーが /login, /signup にアクセス → /dashboard にリダイレクト
@@ -567,6 +649,10 @@ middleware.ts                → セッションリフレッシュ + 認証リ�
 
 Vercel Environment Variables で Production / Preview / Development を分離。Preview 環境は Supabase の同一プロジェクトを参照（RLS でデータ分離済み）。
 
+**Preview 環境の安全対策**:
+- Preview 環境には `SUPABASE_SERVICE_ROLE_KEY` を**設定しない**（RLS バイパスを防止）
+- 将来的に Supabase Branching が利用可能になった場合、Preview 用の別ブランチ DB を検討する
+
 ---
 
 ## 技術的な判断メモ
@@ -579,5 +665,5 @@ Vercel Environment Variables で Production / Preview / Development を分離。
 6. **Supabaseクライアント**: `@supabase/ssr` を使用。Server Components では `createServerClient()`、Client Components では `createBrowserClient()` を使い分ける。
 7. **実現損益**: 移動平均法（日本の税制標準）で計算。将来的にFIFOも `user_settings.cost_method` で切り替え可能にする。
 8. **numeric精度**: 日本株は株価が整数〜小数1桁が大半のため、`numeric(12,2)` を基本とする。配当金のみ `numeric(10,4)` で小数4桁まで対応。
-9. **local_code 5桁固定**: jquants_core 側のマイグレーションで `local_code` は5桁テキストとして定義されていることを確認済み（`COMMENT ON COLUMN ... IS '銘柄コード (5桁)'`）。CHECK制約 `^\d{5}$` は実データと整合する。
+9. **local_code 5桁固定**: jquants_core 側のマイグレーションで `local_code` は5桁テキストとして定義されていることを確認済み（`COMMENT ON COLUMN ... IS '銘柄コード (5桁)'`）。ドメイン型 `portfolio.local_code_t` で CHECK 制約 `^\d{5}$` を一元管理する。
 10. **portfolio_id と user_id の整合性**: transactions / dividend_records で `FOREIGN KEY (portfolio_id, user_id) REFERENCES portfolios(id, user_id)` の複合FKを設定し、他ユーザーのポートフォリオへの誤参照をDB制約レベルで防止する。
